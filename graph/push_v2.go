@@ -2,6 +2,7 @@ package graph
 
 import (
 	"bufio"
+	"bytes"
 	"compress/gzip"
 	"fmt"
 	"io"
@@ -23,6 +24,7 @@ import (
 )
 
 const compressionBufSize = 32768
+const smallImageThresholdBytes = 16 * 1000 * 1000
 
 type v2Pusher struct {
 	*TagStore
@@ -236,13 +238,6 @@ func (p *v2Pusher) pushV2Image(bs distribution.BlobService, img *image.Image) (d
 	}
 	defer arch.Close()
 
-	// Send the layer
-	layerUpload, err := bs.Create(context.Background())
-	if err != nil {
-		return "", err
-	}
-	defer layerUpload.Close()
-
 	reader := progressreader.New(progressreader.Config{
 		In:        ioutil.NopCloser(arch), // we'll take care of close here.
 		Out:       out,
@@ -258,44 +253,74 @@ func (p *v2Pusher) pushV2Image(bs distribution.BlobService, img *image.Image) (d
 		Action:   "Pushing",
 	})
 
-	digester := digest.Canonical.New()
-	// HACK: The MultiWriter doesn't write directly to layerUpload because
-	// we must make sure the ReadFrom is used, not Write. Using Write would
-	// send a PATCH request for every Write call.
-	pipeReader, pipeWriter := io.Pipe()
-	// Use a bufio.Writer to avoid excessive chunking in HTTP request.
-	bufWriter := bufio.NewWriterSize(io.MultiWriter(pipeWriter, digester.Hash()), compressionBufSize)
-	compressor := gzip.NewWriter(bufWriter)
-
-	go func() {
-		_, err := io.Copy(compressor, reader)
-		if err == nil {
-			err = compressor.Close()
-		}
-		if err == nil {
-			err = bufWriter.Flush()
-		}
-		if err != nil {
-			pipeWriter.CloseWithError(err)
-		} else {
-			pipeWriter.Close()
-		}
-	}()
-
 	out.Write(p.sf.FormatProgress(stringid.TruncateID(img.ID), "Pushing", nil))
-	nn, err := layerUpload.ReadFrom(pipeReader)
-	pipeReader.Close()
-	if err != nil {
-		return "", err
+
+	// If the image is small, we'll read the entire compressed layer into memory so we can
+	// compute the digest and perform a monolithic upload, otherwise perform a chunked upload.
+	var desc distribution.Descriptor
+	if img.Size <= smallImageThresholdBytes {
+		logrus.Debugf("decided image is small: %v, size: %v", img.ID, img.Size)
+
+		buf := new(bytes.Buffer)
+		compressor := gzip.NewWriter(buf)
+		_, err := io.Copy(compressor, reader)
+		if err != nil {
+			return "", err
+		} else {
+			compressor.Close()
+		}
+
+		desc, err = bs.Put(context.Background(), "application/octet-stream", buf.Bytes())
+		if err != nil {
+			return "", err
+		}
+	} else {
+		logrus.Debugf("decided image is large: %v, size: %v", img.ID, img.Size)
+
+		digester := digest.Canonical.New()
+		// HACK: The MultiWriter doesn't write directly to layerUpload because
+		// we must make sure the ReadFrom is used, not Write. Using Write would
+		// send a PATCH request for every Write call.
+		pipeReader, pipeWriter := io.Pipe()
+		// Use a bufio.Writer to avoid excessive chunking in HTTP request.
+		bufWriter := bufio.NewWriterSize(io.MultiWriter(pipeWriter, digester.Hash()), compressionBufSize)
+		compressor := gzip.NewWriter(bufWriter)
+
+		go func() {
+			_, err := io.Copy(compressor, reader)
+			if err == nil {
+				err = compressor.Close()
+			}
+			if err == nil {
+				err = bufWriter.Flush()
+			}
+			if err != nil {
+				pipeWriter.CloseWithError(err)
+			} else {
+				pipeWriter.Close()
+			}
+		}()
+
+		layerUpload, err := bs.Create(context.Background())
+		if err != nil {
+			return "", err
+		}
+		defer layerUpload.Close()
+
+		_, err = layerUpload.ReadFrom(pipeReader)
+		pipeReader.Close()
+		if err != nil {
+			return "", err
+		}
+
+		dgst := digester.Digest()
+		if desc, err = layerUpload.Commit(context.Background(), distribution.Descriptor{Digest: dgst}); err != nil {
+			return "", err
+		}
 	}
 
-	dgst := digester.Digest()
-	if _, err := layerUpload.Commit(context.Background(), distribution.Descriptor{Digest: dgst}); err != nil {
-		return "", err
-	}
-
-	logrus.Debugf("uploaded layer %s (%s), %d bytes", img.ID, dgst, nn)
+	logrus.Debugf("uploaded layer %s (%s), %d bytes", img.ID, desc.Digest, desc.Size)
 	out.Write(p.sf.FormatProgress(stringid.TruncateID(img.ID), "Pushed", nil))
 
-	return dgst, nil
+	return desc.Digest, nil
 }
