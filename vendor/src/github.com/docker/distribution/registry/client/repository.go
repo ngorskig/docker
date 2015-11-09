@@ -409,26 +409,39 @@ func (bs *blobs) ServeBlob(ctx context.Context, w http.ResponseWriter, r *http.R
 }
 
 func (bs *blobs) Put(ctx context.Context, mediaType string, p []byte) (distribution.Descriptor, error) {
-	writer, err := bs.Create(ctx)
-	if err != nil {
-		return distribution.Descriptor{}, err
-	}
+	// DO NOT SUBMIT: THIS IS VENDORED CODE, PROTOTYPE CHANGES ONLY.
+
+	// First gather the digest and build our descriptor.
 	dgstr := digest.Canonical.New()
-	n, err := io.Copy(writer, io.TeeReader(bytes.NewReader(p), dgstr.Hash()))
+	n, err := dgstr.Hash().Write(p)
 	if err != nil {
 		return distribution.Descriptor{}, err
 	}
-	if n < int64(len(p)) {
+	if n < len(p) {
 		return distribution.Descriptor{}, fmt.Errorf("short copy: wrote %d of %d", n, len(p))
 	}
-
 	desc := distribution.Descriptor{
 		MediaType: mediaType,
 		Size:      int64(len(p)),
 		Digest:    dgstr.Digest(),
 	}
 
-	return writer.Commit(ctx, desc)
+	// Now POST the entire blob to the registry; we indicate this is a
+	// monolithic upload by adding the intended blob digest to the query string.
+	v := url.Values{}
+	v.Set("digest", desc.Digest.String())
+	u, err := bs.ub.BuildBlobUploadURL(bs.name, v)
+
+	resp, err := bs.client.Post(u, mediaType, bytes.NewReader(p))
+	if err != nil {
+		return distribution.Descriptor{}, err
+	}
+	defer resp.Body.Close()
+
+	if SuccessStatus(resp.StatusCode) {
+		return desc, nil
+	}
+	return distribution.Descriptor{}, handleErrorResponse(resp)
 }
 
 func (bs *blobs) Create(ctx context.Context) (distribution.BlobWriter, error) {
