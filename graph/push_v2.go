@@ -218,7 +218,10 @@ func (p *v2Pusher) pushV2Tag(tag string) error {
 	if err != nil {
 		return err
 	}
-	return manSvc.Put(signed)
+	logrus.Debugf("TIMETIMEBEGIN: manifest: %v, %v", manifestDigest, manifestSize)
+	err = manSvc.Put(signed)
+	logrus.Debugf("TIMETIMEEND: manifest: %v, %v", manifestDigest, manifestSize)
+	return err
 }
 
 func (p *v2Pusher) pushV2Image(bs distribution.BlobService, img *image.Image) (digest.Digest, error) {
@@ -237,7 +240,9 @@ func (p *v2Pusher) pushV2Image(bs distribution.BlobService, img *image.Image) (d
 	defer arch.Close()
 
 	// Send the layer
+	logrus.Debugf("TIMETIMEBEGIN: create layer: %v, %v", img.ID, img.Size)
 	layerUpload, err := bs.Create(context.Background())
+	logrus.Debugf("TIMETIMEEND: create layer: %v, %v", img.ID, img.Size)
 	if err != nil {
 		return "", err
 	}
@@ -283,16 +288,20 @@ func (p *v2Pusher) pushV2Image(bs distribution.BlobService, img *image.Image) (d
 	}()
 
 	out.Write(p.sf.FormatProgress(stringid.TruncateID(img.ID), "Pushing", nil))
+	logrus.Debugf("TIMETIMEBEGIN: read layer: %v, %v", img.ID, img.Size)
 	nn, err := layerUpload.ReadFrom(pipeReader)
+	logrus.Debugf("TIMETIMEEND: read layer: %v, %v", img.ID, img.Size)
 	pipeReader.Close()
 	if err != nil {
 		return "", err
 	}
 
 	dgst := digester.Digest()
+	logrus.Debugf("TIMETIMEBEGIN: commit layer: %v, %v", img.ID, img.Size)
 	if _, err := layerUpload.Commit(context.Background(), distribution.Descriptor{Digest: dgst}); err != nil {
 		return "", err
 	}
+	logrus.Debugf("TIMETIMEEND: commit layer: %v, %v", img.ID, img.Size)
 
 	logrus.Debugf("uploaded layer %s (%s), %d bytes", img.ID, dgst, nn)
 	out.Write(p.sf.FormatProgress(stringid.TruncateID(img.ID), "Pushed", nil))
